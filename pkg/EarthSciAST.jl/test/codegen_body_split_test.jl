@@ -14,15 +14,14 @@
 # The split has TWO transports, and this pins both, on every Julia. Which one a
 # build takes is `_cg_split_by_value`:
 #
-#   * inner `@noinline` definitions inside the generated body, called by name —
-#     the cheapest, and the only one on Julia >= 1.12, where RGF's rewrite of an
-#     inner definition into an opaque closure is typed;
-#   * BY VALUE — each sub-function compiled as its own RuntimeGeneratedFunction
-#     and handed to the body in a tuple appended to `tabs`, called as
-#     `_cgfns[k](...)` at a literal index. Julia < 1.12 takes this one (an inner
-#     definition is an UNTYPED opaque closure there: it boxes per cell and
-#     segfaults when nested), and `ESS_CODEGEN_SPLIT_TRANSPORT=value` forces it
-#     anywhere, which is how the transport is testable on 1.12 as well.
+#   * BY VALUE, the default — each sub-function compiled as its own
+#     RuntimeGeneratedFunction and handed to the body in a tuple appended to
+#     `tabs`, called as `_cgfns[k](...)` at a literal index;
+#   * inner `@noinline` definitions inside the generated body, called by name,
+#     with `ESS_CODEGEN_SPLIT_TRANSPORT=inner` on Julia >= 1.12. RGF rewrites
+#     an inner definition into an opaque closure, which is UNTYPED below 1.12
+#     (it boxes per cell and segfaults when nested), so there the setting is
+#     ignored; on 1.12 it is typed only where the body that builds it calls it.
 #
 # Both emit the SAME partitioned expression, so this pins that the split
 # codegens and is bit-identical under EITHER transport -- there is no Julia on
@@ -192,8 +191,7 @@ _decl(t) = sum(v for (k, v) in t if startswith(String(k), "codegen_decline"); in
     @test _decl(rt) == 0                          # nothing declined
 
     # Forced split: a small fn-node cap makes the body exceed one function. It is
-    # partitioned into sub-functions — and STILL codegens, on EVERY Julia. The
-    # transport differs by version; whether the kernel compiles does not.
+    # partitioned into sub-functions — and STILL codegens, on EVERY Julia.
     fs, v0, ps, st = _bs_build(model, ics; fncap = 40)
     @test get(st, :codegen_kernel, 0) >= 1    # STILL codegen'd (split, not declined)
     @test _decl(st) == 0                      # the split never falls back to the interpreter
@@ -209,11 +207,11 @@ _decl(t) = sum(v for (k, v) in t if startswith(String(k), "codegen_decline"); in
     Jr = ForwardDiff.jacobian(uu -> _bs_du(fr, uu, pr, 0.4), u0)
     @test _bs_same(Js, Jr)
 
-    # The BY-VALUE transport, forced. On Julia < 1.12 this is the same build the
-    # block above already made; on 1.12+ it is the one that would otherwise
-    # never run here, which is the point — a transport a version cannot
-    # exercise is the one that rots.
-    fv, w0, pv, vt = _bs_build(model, ics; fncap = 40, transport = "value")
+    # The INNER-DEFINITION transport, forced. On Julia < 1.12 the setting is
+    # ignored and this is the same build the block above already made; on 1.12+
+    # it is the one that would otherwise never run here, which is the point — a
+    # transport no build takes by default is the one that rots.
+    fv, w0, pv, vt = _bs_build(model, ics; fncap = 40, transport = "inner")
     @test get(vt, :codegen_kernel, 0) >= 1
     @test _decl(vt) == 0
     @test u0 == w0
@@ -223,9 +221,9 @@ _decl(t) = sum(v for (k, v) in t if startswith(String(k), "codegen_decline"); in
     end
     @test _bs_same(ForwardDiff.jacobian(uu -> _bs_du(fv, uu, pv, 0.4), u0), Jr)
 
-    # A by-value build that does NOT split is unchanged by the transport: no
-    # sub-function is minted, so nothing is appended to `tabs`.
-    fn, x0, pn, nt = _bs_build(model, ics; transport = "value")
+    # A build that does NOT split is unchanged by the transport: no
+    # sub-function is minted (so, by value, nothing is appended to `tabs`).
+    fn, x0, pn, nt = _bs_build(model, ics; transport = "inner")
     @test get(nt, :codegen_kernel, 0) >= 1
     @test _decl(nt) == 0
     @test u0 == x0
@@ -249,7 +247,7 @@ end
     aref = _bs_allocs(fr, u0, pr)
     Jr = ForwardDiff.jacobian(uu -> _bs_du(fr, uu, pr, 0.4), u0)
 
-    @testset "transport = $(something(transport, "default"))" for transport in (nothing, "value")
+    @testset "transport = $(something(transport, "default (by value)"))" for transport in (nothing, "inner")
         # A cap this small splits the body into several helpers, one calling
         # another.
         fs, v0, ps, st = _bs_build(model, ics; fncap = 1500, transport, const_arrays = conns)
@@ -267,8 +265,9 @@ end
         @test _bs_same(ForwardDiff.jacobian(uu -> _bs_du(fs, uu, ps, 0.4), u0), Jr)
         # Boxing per cell costs hundreds of KB per call here. The inner-definition
         # transport still allocates per cell when one helper calls another,
-        # however few arguments it passes, so this pins the by-value one.
-        if transport == "value" || !ESM._cg_split_supported()
+        # however few arguments it passes (why it is not the default), so this
+        # pins the default one.
+        if transport === nothing || !ESM._cg_split_supported()
             @test _bs_allocs(fs, v0, ps) <= aref + 1024
         end
     end

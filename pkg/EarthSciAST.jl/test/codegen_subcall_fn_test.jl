@@ -23,9 +23,11 @@
 #   * the size floor (ESS_CG_SUBCALL_FN_MIN_NODES) keeps small bodies inlined
 #     (huge floor ⇒ no functions minted) without changing values;
 #   * the compiled RHS stays allocation-free through the call boundary.
-# On Julia < 1.12 the tier is unavailable (`_cg_split_supported`; the emitted
-# function is the split's inner-`function`-under-RGF mechanism, which boxes
-# there) and the pre-tier inlining is the whole path — the differential
+# The tier needs the split's inner-definition transport, which builds here
+# select (`ESS_CODEGEN_SPLIT_TRANSPORT=inner`). On Julia < 1.12 that transport
+# and so the tier are unavailable (`_cg_split_supported`; the emitted function
+# is the split's inner-`function`-under-RGF mechanism, which boxes there) and
+# the pre-tier inlining is the whole path — the differential
 # testsets then compare the inline emission to itself, which still must hold.
 using Test
 using EarthSciAST
@@ -141,11 +143,13 @@ end
 # tally snapshot. The tiers are OPT-IN (see the default notes in
 # codegen_kernel.jl / stencil.jl), so every non-reference build here enables
 # both the nested boundaries (which mint the `_NK_SUBCALL`s) and the function
-# tier; `disable=true` is the bare default path, the differential reference.
+# tier, with the inner-definition split transport the tier's functions need;
+# `disable=true` is the bare default path, the differential reference.
 function _scf_build(F; disable = false, floor = nothing)
     return withenv(
         "ESS_CG_SUBCALL_FN" => (disable ? nothing : "1"),
         "ESS_NESTED_TEMPLATE_BOUNDARY" => (disable ? nothing : "1"),
+        "ESS_CODEGEN_SPLIT_TRANSPORT" => (disable ? nothing : "inner"),
         "ESS_CG_SUBCALL_FN_MIN_NODES" => (floor === nothing ? nothing : string(floor))
     ) do
         ESM._reset_cascade_tally!()

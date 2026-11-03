@@ -1028,12 +1028,13 @@ end
 # `K.subs` holds every transitive sub, nested-first); its slot locals arrive
 # through the sorted `extra` parameters like any other passable name.
 #
-# A tiny body (≤ `_cg_subcall_fn_min_nodes()`) stays inlined per site, and
-# Julia < 1.12 keeps the pre-tier inlining wholesale — the emitted function is
+# A tiny body (≤ `_cg_subcall_fn_min_nodes()`) stays inlined per site, and a
+# by-value build keeps the pre-tier inlining wholesale — the emitted function is
 # the same inner-`function`-under-RGF mechanism as the split's inner-definition
-# transport, which boxes and segfaults there (`_cg_split_supported`). This tier
-# has not been ported to the by-value transport the split takes instead; it
-# ships off, so nothing on those versions depends on it.
+# transport, so the tier needs that transport (`ESS_CODEGEN_SPLIT_TRANSPORT=inner`
+# on Julia >= 1.12; it boxes and segfaults below, `_cg_split_supported`). It
+# has not been ported to the by-value transport the split takes by default; it
+# ships off, so nothing depends on it.
 # Canonicalizer/parametrizer for one emitted sub-kernel body
 # (ess-cg-subcall-struct). Rewrites the expression so that everything that
 # varies between two structurally-equal sub-kernels becomes an ARGUMENT:
@@ -1173,7 +1174,7 @@ function _cg_emit_subcall(ctx::_CGCtx, kc::_CGKernCtx, S::_AccKernel)
     invsyms === nothing && throw(_CodegenDecline(:subcall_order))
     # The function tier passes the three-dim cell context as its formal
     # parameters, so a body read past the third dim is inlined instead.
-    if _cg_split_supported() && !_cg_subcall_fn_disabled() && isempty(kc.mix)
+    if !_cg_split_by_value() && !_cg_subcall_fn_disabled() && isempty(kc.mix)
         got = _cg_subcall_fn!(ctx, S, invsyms)
         if got !== :inline
             fname, extra, ints, flts =
@@ -1608,7 +1609,7 @@ function _cg_emit_kernel_nest!(ctx::_CGCtx, K::_AccKernel, invsyms::Vector{Symbo
     sm = ctx.scanmode
     _cg_note_nest!(ctx, K)
     cellfn = (
-            sm === nothing && _cg_split_supported() && !_cg_subcall_fn_disabled() &&
+            sm === nothing && !_cg_split_by_value() && !_cg_subcall_fn_disabled() &&
             length(K.cells.strides) <= 3
         ) ?
         _cg_cell_fn!(ctx, K, invsyms) : nothing
@@ -2007,7 +2008,7 @@ end
 # the group's first kernel in build order.
 function _cg_rowfuse_groups(kernels::AbstractVector{_AccKernel})
     out = Dict{Int, Vector{Int}}()
-    (_cg_split_supported() && !_cg_subcall_fn_disabled()) && return out
+    (!_cg_split_by_value() && !_cg_subcall_fn_disabled()) && return out
     # Which boxes share their rows is read from the rows a tile runs, so a
     # tile that shares its code emits every box as its own nest.
     _range_shared_code(_range_spec_now()) && return out
@@ -2645,12 +2646,15 @@ _codegen_fn_node_cap() =
 # boxes every scalar crossing the boundary, which is a per-cell leak linear in
 # the grid, and a NEST of them (a helper calling a helper) segfaults: the
 # MethodError such a call raises crashes the runtime while it is being
-# constructed. 1.12's optimizer types and elides the closure, which is why the
-# inner-definition transport is allocation-free and stable only there.
+# constructed. 1.12's optimizer types and elides the closure where the body
+# that builds it calls it, which is why the inner-definition transport is
+# stable only there — but a closure called from inside another still boxes,
+# which is why it is not the default (`_cg_split_by_value`).
 #
-# This also gates the EXPERIMENTAL sub-kernel function tier
-# (`_cg_subcall_fn`/`_cg_cell_fn!`), which emits inner definitions of its own and
-# has not been ported to the by-value transport. That tier ships off.
+# The EXPERIMENTAL sub-kernel function tier (`_cg_subcall_fn`/`_cg_cell_fn!`)
+# emits inner definitions of its own and has not been ported to the by-value
+# transport, so it runs only where a build takes the inner-definition one
+# (`!_cg_split_by_value()`). That tier ships off.
 _cg_split_supported() = VERSION >= v"1.12"
 
 # The name a by-value build gives the tuple of emitted sub-functions.
@@ -2659,30 +2663,33 @@ const _CG_FNS = :_cgfns
 # TRANSPORT for the emitted sub-functions. There are two, and they emit the same
 # code — they differ only in how a sub-function reaches the body that calls it.
 #
-#   INNER DEFINITION (Julia ≥ 1.12): the sub-function is an `@noinline function`
-#     written inside the generated body and called by name. Cheapest, and what
-#     the split shipped as, but it only works where RGF's rewrite of an inner
-#     definition into an opaque closure is typed — see `_cg_split_supported`.
+#   BY VALUE (the default): each sub-function is compiled as its OWN
+#     `RuntimeGeneratedFunction` and handed to the body at run time in a tuple,
+#     appended to the `tabs` argument; a call site is `_cgfns[k](…)` at a
+#     LITERAL `k`, so the callee is a concrete callable the compiler resolves
+#     statically — no closure is constructed. The tuple is threaded into every
+#     sub-function that calls another, so nesting works to any depth.
 #
-#   BY VALUE (Julia < 1.12, or `ESS_CODEGEN_SPLIT_TRANSPORT=value`): each
-#     sub-function is compiled as its OWN `RuntimeGeneratedFunction` and handed
-#     to the body at run time in a tuple, appended to the `tabs` argument; a call
-#     site is `_cgfns[k](…)` at a LITERAL `k`, so the callee is a concrete
-#     callable the compiler resolves statically — no closure is constructed, and
-#     nothing is boxed. The tuple is threaded into every sub-function that calls
-#     another, so nesting works to any depth.
+#   INNER DEFINITION (Julia ≥ 1.12, with `ESS_CODEGEN_SPLIT_TRANSPORT=inner`):
+#     the sub-function is an `@noinline function` written inside the generated
+#     body and called by name — what the split shipped as. RGF rewrites it into
+#     an opaque closure (`_cg_split_supported`), which 1.12 types only where the
+#     body that builds it calls it: a helper called from another helper, or
+#     from a chunk sub-function, boxes every argument and its result on every
+#     call, however few arguments it takes. On reseact's transport RHS (a
+#     7x7x8 slice) that is 332 ms per call, against 1.9 ms by value.
 #
-# The second exists so `compiler=:native` can split a body on EVERY supported
+# By value is also what lets `compiler=:native` split a body on EVERY supported
 # Julia. `native` is the tier that has to be universally available — no heavy
 # external dependency, and no version where an oversized kernel has nowhere to
 # go but the per-cell interpreter, which under the strict compiler is a refusal.
 # (`:interpreter` stays the simple oracle; `sympy`/`mtk` only take some
 # documents; `xla` needs heavy dependencies.) Both transports emit the SAME
 # partitioned expression, so a build is value-identical either way — which is
-# what the transport override is for: it makes the by-value path testable on a
-# Julia that would otherwise never take it.
+# what the transport override is for: it keeps the inner-definition path
+# testable now that no build takes it by default.
 _cg_split_by_value() =
-    !_cg_split_supported() || get(ENV, "ESS_CODEGEN_SPLIT_TRANSPORT", "") == "value"
+    !_cg_split_supported() || get(ENV, "ESS_CODEGEN_SPLIT_TRANSPORT", "") != "inner"
 
 # Every Symbol referenced anywhere in `ex` (recursively). Used to compute the
 # exact set of outer-scope locals a chunk function must receive as arguments.
@@ -3096,9 +3103,9 @@ function _build_codegen_rhs(
     # sub-function at all.
     #
     # A genuine split (several chunks) emits one sub-function per chunk, carried
-    # by whichever transport this Julia uses (`_cg_split_by_value`): an inner
-    # `@noinline` definition called by name, or its own generated function
-    # called out of the helper tuple.
+    # by whichever transport the build uses (`_cg_split_by_value`): its own
+    # generated function called out of the helper tuple, or an inner
+    # `@noinline` definition called by name.
     fndefs = Any[]; callstmts = Any[]
     if length(chunks) == 1
         push!(
