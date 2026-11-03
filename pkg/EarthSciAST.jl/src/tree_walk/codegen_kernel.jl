@@ -290,6 +290,11 @@ mutable struct _CGCtx
     progeo::Dict{Any, Symbol}
     invmemo::Dict{Any, Symbol}
     prolog::Vector{Tuple{Int, Bool, Any}}
+    # The statement list (a geometry sink, or the invariant prologue) each
+    # loop-invariant local was bound in — geometry, hoisted tables, invariant
+    # slots and split-helper packs. A split helper receives the ones bound in
+    # the sink it is spilled from as ONE packed argument (`_cg_spill!`).
+    hoisted::Dict{Symbol, Vector{Any}}
 end
 _CGCtx(budget::Int, shared_cache::Union{Nothing, _CSECache} = nothing; nst::Int = 0) =
     _CGCtx(
@@ -301,7 +306,8 @@ _CGCtx(budget::Int, shared_cache::Union{Nothing, _CSECache} = nothing; nst::Int 
     Int[], Any[], IdDict{Any, Symbol}(), false, false, Symbol[], nothing,
     nst, IdDict{Any, Tuple{Int, Int}}(), IdDict{Any, Bool}(),
     IdDict{Any, Tuple{Int, Int}}(), nothing,
-    Dict{Any, Symbol}(), Dict{Any, Symbol}(), Tuple{Int, Bool, Any}[]
+    Dict{Any, Symbol}(), Dict{Any, Symbol}(), Tuple{Int, Bool, Any}[],
+    Dict{Symbol, Vector{Any}}()
 )
 
 _cg_helper_dedup_disabled() = !_compiler_plan_now().cg_helper_dedup
@@ -400,6 +406,7 @@ function _cg_geo!(ctx::_CGCtx, v::Int, key = nothing, unit::Bool = false)
     push!(ctx.geo, v)
     s = _cg_name(ctx, "G")
     push!(ctx.geosink, :(local $s = $(_cg_tab!(ctx, ctx.geo))[$(length(ctx.geo))]))
+    ctx.hoisted[s] = ctx.geosink
     key === nothing || (ctx.geomemo[key] = s)
     if pkey !== nothing
         ctx.progeo[pkey] = s
@@ -422,6 +429,7 @@ function _cg_tabh!(ctx::_CGCtx, obj)
     got === nothing || return got
     s = _cg_name(ctx, "tb")
     push!(ctx.geosink, :(local $s = $ref))
+    ctx.hoisted[s] = ctx.geosink
     ctx.geomemo[key] = s
     return s
 end
@@ -1020,12 +1028,13 @@ end
 # `K.subs` holds every transitive sub, nested-first); its slot locals arrive
 # through the sorted `extra` parameters like any other passable name.
 #
-# A tiny body (≤ `_cg_subcall_fn_min_nodes()`) stays inlined per site, and
-# Julia < 1.12 keeps the pre-tier inlining wholesale — the emitted function is
+# A tiny body (≤ `_cg_subcall_fn_min_nodes()`) stays inlined per site, and a
+# by-value build keeps the pre-tier inlining wholesale — the emitted function is
 # the same inner-`function`-under-RGF mechanism as the split's inner-definition
-# transport, which boxes and segfaults there (`_cg_split_supported`). This tier
-# has not been ported to the by-value transport the split takes instead; it
-# ships off, so nothing on those versions depends on it.
+# transport, so the tier needs that transport (`ESS_CODEGEN_SPLIT_TRANSPORT=inner`
+# on Julia >= 1.12; it boxes and segfaults below, `_cg_split_supported`). It
+# has not been ported to the by-value transport the split takes by default; it
+# ships off, so nothing depends on it.
 # Canonicalizer/parametrizer for one emitted sub-kernel body
 # (ess-cg-subcall-struct). Rewrites the expression so that everything that
 # varies between two structurally-equal sub-kernels becomes an ARGUMENT:
@@ -1165,7 +1174,7 @@ function _cg_emit_subcall(ctx::_CGCtx, kc::_CGKernCtx, S::_AccKernel)
     invsyms === nothing && throw(_CodegenDecline(:subcall_order))
     # The function tier passes the three-dim cell context as its formal
     # parameters, so a body read past the third dim is inlined instead.
-    if _cg_split_supported() && !_cg_subcall_fn_disabled() && isempty(kc.mix)
+    if !_cg_split_by_value() && !_cg_subcall_fn_disabled() && isempty(kc.mix)
         got = _cg_subcall_fn!(ctx, S, invsyms)
         if got !== :inline
             fname, extra, ints, flts =
@@ -1401,6 +1410,7 @@ function _cg_inv!(ctx::_CGCtx, K::_AccKernel)
             end
             s = _cg_name(ctx, "v")
             push!(ctx.prologue, :(local $s = $e))
+            ctx.hoisted[s] = ctx.prologue
             push!(syms, s)
             ctx.invmemo[e] = s
             push!(ctx.prolog, (length(ctx.prologue), true, e))
@@ -1599,7 +1609,7 @@ function _cg_emit_kernel_nest!(ctx::_CGCtx, K::_AccKernel, invsyms::Vector{Symbo
     sm = ctx.scanmode
     _cg_note_nest!(ctx, K)
     cellfn = (
-            sm === nothing && _cg_split_supported() && !_cg_subcall_fn_disabled() &&
+            sm === nothing && !_cg_split_by_value() && !_cg_subcall_fn_disabled() &&
             length(K.cells.strides) <= 3
         ) ?
         _cg_cell_fn!(ctx, K, invsyms) : nothing
@@ -1998,7 +2008,7 @@ end
 # the group's first kernel in build order.
 function _cg_rowfuse_groups(kernels::AbstractVector{_AccKernel})
     out = Dict{Int, Vector{Int}}()
-    (_cg_split_supported() && !_cg_subcall_fn_disabled()) && return out
+    (!_cg_split_by_value() && !_cg_subcall_fn_disabled()) && return out
     # Which boxes share their rows is read from the rows a tile runs, so a
     # tile that shares its code emits every box as its own nest.
     _range_shared_code(_range_spec_now()) && return out
@@ -2636,12 +2646,15 @@ _codegen_fn_node_cap() =
 # boxes every scalar crossing the boundary, which is a per-cell leak linear in
 # the grid, and a NEST of them (a helper calling a helper) segfaults: the
 # MethodError such a call raises crashes the runtime while it is being
-# constructed. 1.12's optimizer types and elides the closure, which is why the
-# inner-definition transport is allocation-free and stable only there.
+# constructed. 1.12's optimizer types and elides the closure where the body
+# that builds it calls it, which is why the inner-definition transport is
+# stable only there — but a closure called from inside another still boxes,
+# which is why it is not the default (`_cg_split_by_value`).
 #
-# This also gates the EXPERIMENTAL sub-kernel function tier
-# (`_cg_subcall_fn`/`_cg_cell_fn!`), which emits inner definitions of its own and
-# has not been ported to the by-value transport. That tier ships off.
+# The EXPERIMENTAL sub-kernel function tier (`_cg_subcall_fn`/`_cg_cell_fn!`)
+# emits inner definitions of its own and has not been ported to the by-value
+# transport, so it runs only where a build takes the inner-definition one
+# (`!_cg_split_by_value()`). That tier ships off.
 _cg_split_supported() = VERSION >= v"1.12"
 
 # The name a by-value build gives the tuple of emitted sub-functions.
@@ -2650,30 +2663,33 @@ const _CG_FNS = :_cgfns
 # TRANSPORT for the emitted sub-functions. There are two, and they emit the same
 # code — they differ only in how a sub-function reaches the body that calls it.
 #
-#   INNER DEFINITION (Julia ≥ 1.12): the sub-function is an `@noinline function`
-#     written inside the generated body and called by name. Cheapest, and what
-#     the split shipped as, but it only works where RGF's rewrite of an inner
-#     definition into an opaque closure is typed — see `_cg_split_supported`.
+#   BY VALUE (the default): each sub-function is compiled as its OWN
+#     `RuntimeGeneratedFunction` and handed to the body at run time in a tuple,
+#     appended to the `tabs` argument; a call site is `_cgfns[k](…)` at a
+#     LITERAL `k`, so the callee is a concrete callable the compiler resolves
+#     statically — no closure is constructed. The tuple is threaded into every
+#     sub-function that calls another, so nesting works to any depth.
 #
-#   BY VALUE (Julia < 1.12, or `ESS_CODEGEN_SPLIT_TRANSPORT=value`): each
-#     sub-function is compiled as its OWN `RuntimeGeneratedFunction` and handed
-#     to the body at run time in a tuple, appended to the `tabs` argument; a call
-#     site is `_cgfns[k](…)` at a LITERAL `k`, so the callee is a concrete
-#     callable the compiler resolves statically — no closure is constructed, and
-#     nothing is boxed. The tuple is threaded into every sub-function that calls
-#     another, so nesting works to any depth.
+#   INNER DEFINITION (Julia ≥ 1.12, with `ESS_CODEGEN_SPLIT_TRANSPORT=inner`):
+#     the sub-function is an `@noinline function` written inside the generated
+#     body and called by name — what the split shipped as. RGF rewrites it into
+#     an opaque closure (`_cg_split_supported`), which 1.12 types only where the
+#     body that builds it calls it: a helper called from another helper, or
+#     from a chunk sub-function, boxes every argument and its result on every
+#     call, however few arguments it takes. On reseact's transport RHS (a
+#     7x7x8 slice) that is 332 ms per call, against 1.9 ms by value.
 #
-# The second exists so `compiler=:native` can split a body on EVERY supported
+# By value is also what lets `compiler=:native` split a body on EVERY supported
 # Julia. `native` is the tier that has to be universally available — no heavy
 # external dependency, and no version where an oversized kernel has nowhere to
 # go but the per-cell interpreter, which under the strict compiler is a refusal.
 # (`:interpreter` stays the simple oracle; `sympy`/`mtk` only take some
 # documents; `xla` needs heavy dependencies.) Both transports emit the SAME
 # partitioned expression, so a build is value-identical either way — which is
-# what the transport override is for: it makes the by-value path testable on a
-# Julia that would otherwise never take it.
+# what the transport override is for: it keeps the inner-definition path
+# testable now that no build takes it by default.
 _cg_split_by_value() =
-    !_cg_split_supported() || get(ENV, "ESS_CODEGEN_SPLIT_TRANSPORT", "") == "value"
+    !_cg_split_supported() || get(ENV, "ESS_CODEGEN_SPLIT_TRANSPORT", "") != "inner"
 
 # Every Symbol referenced anywhere in `ex` (recursively). Used to compute the
 # exact set of outer-scope locals a chunk function must receive as arguments.
@@ -2773,42 +2789,77 @@ end
 _cg_is_passable(s::Symbol) =
     (n = String(s); startswith(n, "_cg") && s !== :_cgT && !startswith(n, "_cgh"))
 
+# The parameter a split helper receives its packed loop-invariant locals in.
+const _CG_PACK = :_cgpk
+
+# The tuple of loop-invariant locals `names` a split helper receives as its
+# `_CG_PACK` argument (`_cg_spill!`). It is bound in the current sink, after
+# every local it holds and ahead of every loop that calls the helper, so it is
+# built once per run of that sink, never per cell; and it is shared by every
+# helper spilled from the sink that takes the same locals.
+function _cg_pack!(ctx::_CGCtx, names::Vector{Symbol})
+    key = (:pack, names...)
+    got = get(ctx.geomemo, key, nothing)
+    got === nothing || return got
+    s = _cg_name(ctx, "pk")
+    push!(ctx.geosink, :(local $s = $(Expr(:tuple, names...))))
+    ctx.hoisted[s] = ctx.geosink
+    ctx.geomemo[key] = s
+    return s
+end
+
 # Spill `sub` (already ≤ cap) into a fresh `@noinline` helper returning its
 # value; return the call expression that replaces it. Tab reads in `sub` are
 # already the by-type container indices `_cggrpG[pos]` (ess-iip-tabgroup), so the
 # helper's tab dependency is ONE argument per GROUP (a few concrete-typed
 # containers) no matter how many distinct tabs it touches — this is what keeps
 # the split's parameter/inference cost from exploding with the tab count.
+#
+# The loop-invariant locals bound in the sink `sub` is spilled from (geometry,
+# hoisted tables, invariant slots, other helpers' packs: `ctx.hoisted`) arrive
+# the same way, as ONE tuple argument (`_cg_pack!`) that the helper unpacks at
+# literal indices. A large stencil body references hundreds of them; passed one
+# argument each, a by-value call with that many arguments is not inferred, so
+# every argument is boxed on every call and the RHS allocates per cell.
 function _cg_spill!(ctx::_CGCtx, sub)
     syms = Set{Symbol}()
     _cg_collect_syms!(syms, sub)                     # `_cggrpG` containers + coords + child calls
     bound = _cg_collect_bound!(Set{Symbol}(), sub)   # names the helper binds itself
     extra = sort!([s for s in syms if _cg_is_passable(s) && !(s in bound)]; by = string)
+    sink = ctx.geosink
+    packed = Symbol[s for s in extra if get(ctx.hoisted, s, nothing) === sink]
     params = Symbol[:u, :p, :t]
-    append!(params, extra)
+    append!(params, (s for s in extra if get(ctx.hoisted, s, nothing) !== sink))
+    isempty(packed) || push!(params, _CG_PACK)
     # By-value transport: the helper is its own generated function, so the tuple
     # of helpers has to travel INTO it — a helper may call another. It is the
     # last parameter, and it is added unconditionally so the parameter list is a
     # function of the body alone, which is what the dedup key assumes.
     byval = _cg_split_by_value()
     (byval && !(_CG_FNS in params)) && push!(params, _CG_FNS)
+    # The call passes this sink's pack where the helper takes `_CG_PACK`.
+    args = isempty(packed) ? params : replace(params, _CG_PACK => _cg_pack!(ctx, packed))
     # Helper dedup: an identical body (same code ⇒ same params, since params are
     # exactly the passable names it references) reuses the first helper minted for
     # it. Only the CALL is re-emitted; the compiled function is shared. Value-exact
     # and laziness-preserving — a call in place of the sub-expression evaluates
-    # exactly when the sub-expression would.
+    # exactly when the sub-expression would. Which names are packed depends on
+    # the sink as well as the body, so the key carries them.
     dedup = !_cg_helper_dedup_disabled()
-    key = dedup ? string(sub) : ""
+    key = dedup ? string(sub, "\n", join(packed, ' ')) : ""
     if dedup
         got = get(ctx.helper_dedup, key, nothing)
         if got !== nothing
             _tally_cascade!(:cg_helper_deduped)
-            return Expr(:call, got, params...)
+            return Expr(:call, got, args...)
         end
     end
     ln = LineNumberNode(0, Symbol("ess-iip-split"))
     stmts = Any[]
     (:_cgT in syms) && push!(stmts, :(local _cgT = _rhs_value_type(u, p, t)))
+    for (i, s) in enumerate(packed)
+        push!(stmts, :(local $s = getfield($_CG_PACK, $i)))
+    end
     push!(stmts, Expr(:macrocall, Symbol("@inbounds"), ln, :(return $sub)))
     if byval
         # An ARGUMENT-TUPLE definition, compiled on its own at the end of the
@@ -2823,13 +2874,13 @@ function _cg_spill!(ctx::_CGCtx, sub)
         )
         callee = Expr(:ref, _CG_FNS, length(ctx.helpers))
         dedup && (ctx.helper_dedup[key] = callee)
-        return Expr(:call, callee, params...)
+        return Expr(:call, callee, args...)
     end
     fname = _cg_name(ctx, "h")
     fdef = Expr(:function, Expr(:call, fname, params...), Expr(:block, stmts...))
     push!(ctx.helpers, Expr(:macrocall, Symbol("@noinline"), ln, fdef))
     dedup && (ctx.helper_dedup[key] = fname)
-    return Expr(:call, fname, params...)
+    return Expr(:call, fname, args...)
 end
 
 # Partition `ex` so every generated function (this expression and every helper
@@ -3052,9 +3103,9 @@ function _build_codegen_rhs(
     # sub-function at all.
     #
     # A genuine split (several chunks) emits one sub-function per chunk, carried
-    # by whichever transport this Julia uses (`_cg_split_by_value`): an inner
-    # `@noinline` definition called by name, or its own generated function
-    # called out of the helper tuple.
+    # by whichever transport the build uses (`_cg_split_by_value`): its own
+    # generated function called out of the helper tuple, or an inner
+    # `@noinline` definition called by name.
     fndefs = Any[]; callstmts = Any[]
     if length(chunks) == 1
         push!(
