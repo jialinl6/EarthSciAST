@@ -290,6 +290,11 @@ mutable struct _CGCtx
     progeo::Dict{Any, Symbol}
     invmemo::Dict{Any, Symbol}
     prolog::Vector{Tuple{Int, Bool, Any}}
+    # The statement list (a geometry sink, or the invariant prologue) each
+    # loop-invariant local was bound in — geometry, hoisted tables, invariant
+    # slots and split-helper packs. A split helper receives the ones bound in
+    # the sink it is spilled from as ONE packed argument (`_cg_spill!`).
+    hoisted::Dict{Symbol, Vector{Any}}
 end
 _CGCtx(budget::Int, shared_cache::Union{Nothing, _CSECache} = nothing; nst::Int = 0) =
     _CGCtx(
@@ -301,7 +306,8 @@ _CGCtx(budget::Int, shared_cache::Union{Nothing, _CSECache} = nothing; nst::Int 
     Int[], Any[], IdDict{Any, Symbol}(), false, false, Symbol[], nothing,
     nst, IdDict{Any, Tuple{Int, Int}}(), IdDict{Any, Bool}(),
     IdDict{Any, Tuple{Int, Int}}(), nothing,
-    Dict{Any, Symbol}(), Dict{Any, Symbol}(), Tuple{Int, Bool, Any}[]
+    Dict{Any, Symbol}(), Dict{Any, Symbol}(), Tuple{Int, Bool, Any}[],
+    Dict{Symbol, Vector{Any}}()
 )
 
 _cg_helper_dedup_disabled() = !_compiler_plan_now().cg_helper_dedup
@@ -400,6 +406,7 @@ function _cg_geo!(ctx::_CGCtx, v::Int, key = nothing, unit::Bool = false)
     push!(ctx.geo, v)
     s = _cg_name(ctx, "G")
     push!(ctx.geosink, :(local $s = $(_cg_tab!(ctx, ctx.geo))[$(length(ctx.geo))]))
+    ctx.hoisted[s] = ctx.geosink
     key === nothing || (ctx.geomemo[key] = s)
     if pkey !== nothing
         ctx.progeo[pkey] = s
@@ -422,6 +429,7 @@ function _cg_tabh!(ctx::_CGCtx, obj)
     got === nothing || return got
     s = _cg_name(ctx, "tb")
     push!(ctx.geosink, :(local $s = $ref))
+    ctx.hoisted[s] = ctx.geosink
     ctx.geomemo[key] = s
     return s
 end
@@ -1401,6 +1409,7 @@ function _cg_inv!(ctx::_CGCtx, K::_AccKernel)
             end
             s = _cg_name(ctx, "v")
             push!(ctx.prologue, :(local $s = $e))
+            ctx.hoisted[s] = ctx.prologue
             push!(syms, s)
             ctx.invmemo[e] = s
             push!(ctx.prolog, (length(ctx.prologue), true, e))
@@ -2773,42 +2782,77 @@ end
 _cg_is_passable(s::Symbol) =
     (n = String(s); startswith(n, "_cg") && s !== :_cgT && !startswith(n, "_cgh"))
 
+# The parameter a split helper receives its packed loop-invariant locals in.
+const _CG_PACK = :_cgpk
+
+# The tuple of loop-invariant locals `names` a split helper receives as its
+# `_CG_PACK` argument (`_cg_spill!`). It is bound in the current sink, after
+# every local it holds and ahead of every loop that calls the helper, so it is
+# built once per run of that sink, never per cell; and it is shared by every
+# helper spilled from the sink that takes the same locals.
+function _cg_pack!(ctx::_CGCtx, names::Vector{Symbol})
+    key = (:pack, names...)
+    got = get(ctx.geomemo, key, nothing)
+    got === nothing || return got
+    s = _cg_name(ctx, "pk")
+    push!(ctx.geosink, :(local $s = $(Expr(:tuple, names...))))
+    ctx.hoisted[s] = ctx.geosink
+    ctx.geomemo[key] = s
+    return s
+end
+
 # Spill `sub` (already ≤ cap) into a fresh `@noinline` helper returning its
 # value; return the call expression that replaces it. Tab reads in `sub` are
 # already the by-type container indices `_cggrpG[pos]` (ess-iip-tabgroup), so the
 # helper's tab dependency is ONE argument per GROUP (a few concrete-typed
 # containers) no matter how many distinct tabs it touches — this is what keeps
 # the split's parameter/inference cost from exploding with the tab count.
+#
+# The loop-invariant locals bound in the sink `sub` is spilled from (geometry,
+# hoisted tables, invariant slots, other helpers' packs: `ctx.hoisted`) arrive
+# the same way, as ONE tuple argument (`_cg_pack!`) that the helper unpacks at
+# literal indices. A large stencil body references hundreds of them; passed one
+# argument each, a by-value call with that many arguments is not inferred, so
+# every argument is boxed on every call and the RHS allocates per cell.
 function _cg_spill!(ctx::_CGCtx, sub)
     syms = Set{Symbol}()
     _cg_collect_syms!(syms, sub)                     # `_cggrpG` containers + coords + child calls
     bound = _cg_collect_bound!(Set{Symbol}(), sub)   # names the helper binds itself
     extra = sort!([s for s in syms if _cg_is_passable(s) && !(s in bound)]; by = string)
+    sink = ctx.geosink
+    packed = Symbol[s for s in extra if get(ctx.hoisted, s, nothing) === sink]
     params = Symbol[:u, :p, :t]
-    append!(params, extra)
+    append!(params, (s for s in extra if get(ctx.hoisted, s, nothing) !== sink))
+    isempty(packed) || push!(params, _CG_PACK)
     # By-value transport: the helper is its own generated function, so the tuple
     # of helpers has to travel INTO it — a helper may call another. It is the
     # last parameter, and it is added unconditionally so the parameter list is a
     # function of the body alone, which is what the dedup key assumes.
     byval = _cg_split_by_value()
     (byval && !(_CG_FNS in params)) && push!(params, _CG_FNS)
+    # The call passes this sink's pack where the helper takes `_CG_PACK`.
+    args = isempty(packed) ? params : replace(params, _CG_PACK => _cg_pack!(ctx, packed))
     # Helper dedup: an identical body (same code ⇒ same params, since params are
     # exactly the passable names it references) reuses the first helper minted for
     # it. Only the CALL is re-emitted; the compiled function is shared. Value-exact
     # and laziness-preserving — a call in place of the sub-expression evaluates
-    # exactly when the sub-expression would.
+    # exactly when the sub-expression would. Which names are packed depends on
+    # the sink as well as the body, so the key carries them.
     dedup = !_cg_helper_dedup_disabled()
-    key = dedup ? string(sub) : ""
+    key = dedup ? string(sub, "\n", join(packed, ' ')) : ""
     if dedup
         got = get(ctx.helper_dedup, key, nothing)
         if got !== nothing
             _tally_cascade!(:cg_helper_deduped)
-            return Expr(:call, got, params...)
+            return Expr(:call, got, args...)
         end
     end
     ln = LineNumberNode(0, Symbol("ess-iip-split"))
     stmts = Any[]
     (:_cgT in syms) && push!(stmts, :(local _cgT = _rhs_value_type(u, p, t)))
+    for (i, s) in enumerate(packed)
+        push!(stmts, :(local $s = getfield($_CG_PACK, $i)))
+    end
     push!(stmts, Expr(:macrocall, Symbol("@inbounds"), ln, :(return $sub)))
     if byval
         # An ARGUMENT-TUPLE definition, compiled on its own at the end of the
@@ -2823,13 +2867,13 @@ function _cg_spill!(ctx::_CGCtx, sub)
         )
         callee = Expr(:ref, _CG_FNS, length(ctx.helpers))
         dedup && (ctx.helper_dedup[key] = callee)
-        return Expr(:call, callee, params...)
+        return Expr(:call, callee, args...)
     end
     fname = _cg_name(ctx, "h")
     fdef = Expr(:function, Expr(:call, fname, params...), Expr(:block, stmts...))
     push!(ctx.helpers, Expr(:macrocall, Symbol("@noinline"), ln, fdef))
     dedup && (ctx.helper_dedup[key] = fname)
-    return Expr(:call, fname, params...)
+    return Expr(:call, fname, args...)
 end
 
 # Partition `ex` so every generated function (this expression and every helper
