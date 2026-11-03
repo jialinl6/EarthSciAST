@@ -3244,6 +3244,10 @@ end
 # `tp*`/`tt*`/`te*` the `(p, t, forcing epoch)` its time-cadence observeds were
 # filled for (`_pstamp`, cadence_stamp.jl). A freshly allocated `alt` holds no
 # valid block, so allocating one invalidates both of its stamps.
+#
+# `nostate` is the state part of the Float64 slot space an `alt` call fills the
+# Float64 buffer through (`_obsext_cadence_from_f64!`): all NaN, since the
+# const- and time-cadence observeds read no state, so a read of it would show.
 mutable struct _ObsExtVec
     f64::Vector{Float64}
     alt::Any
@@ -3257,13 +3261,21 @@ mutable struct _ObsExtVec
     tealt::UInt64
     epoch::_ForcingEpoch
     ustash::Any
+    nostate::Vector{Float64}
+    # The `alt` buffer's stamp `t` when it is a Float64 — what every state
+    # Jacobian stamps — kept out of `ttalt`, which then holds `_OBS_T_F64`:
+    # a Float64 stored in an `Any` field is a heap box per new `t`.
+    ttalt64::Float64
 end
 _ObsExtVec(n::Int, epoch::_ForcingEpoch = _new_forcing_epoch()) =
     _ObsExtVec(
     _zeros_f64(n), nothing, _CSE_INVALID, _CSE_INVALID,
     _CSE_INVALID, NaN, UInt64(0), _CSE_INVALID, _CSE_INVALID, UInt64(0),
-    epoch, nothing
+    epoch, nothing, Float64[], NaN
 )
+# `ttalt` when the `alt` stamp's `t` is the Float64 in `ttalt64`.
+struct _ObsTF64 end
+const _OBS_T_F64 = _ObsTF64()
 # The state part of the call's slot space: `u` itself when it is a `Vector{T}`,
 # else `u` converted into the stash, as the copy into one extended vector did.
 @inline _obsext_state(s::_ObsExtVec, u::Vector{T}, ::Type{T}) where {T} = u
@@ -3304,7 +3316,10 @@ end
 @inline _obsext_t_stale(s::_ObsExtVec, ::Type{Float64}, p, t) =
     !(t === s.tt64 && s.te64 === _epoch_value(s.epoch) && _pstamp_same(s.tp64, p))
 @inline _obsext_t_stale(s::_ObsExtVec, ::Type{T}, p, t) where {T} =
-    !(s.ttalt === t && s.tealt === _epoch_value(s.epoch) && _pstamp_same(s.tpalt, p))
+    !(_obsext_alt_t_same(s, t) && s.tealt === _epoch_value(s.epoch) && _pstamp_same(s.tpalt, p))
+@inline _obsext_alt_t_same(s::_ObsExtVec, t::Float64) =
+    s.ttalt === _OBS_T_F64 && s.ttalt64 === t
+@inline _obsext_alt_t_same(s::_ObsExtVec, t) = s.ttalt === t
 @inline function _obsext_mark_t!(s::_ObsExtVec, ::Type{Float64}, p, t)
     if t isa Float64
         _pstamp_same(s.tp64, p) || (s.tp64 = _pstamp_reuse(s.tp64, p))
@@ -3318,12 +3333,97 @@ end
 @inline function _obsext_mark_t!(s::_ObsExtVec, ::Type{T}, p, t) where {T}
     if isbits(t)
         _pstamp_same(s.tpalt, p) || (s.tpalt = _pstamp_reuse(s.tpalt, p))
-        s.ttalt === t || (s.ttalt = t)
+        if t isa Float64
+            s.ttalt64 = t
+            s.ttalt === _OBS_T_F64 || (s.ttalt = _OBS_T_F64)
+        else
+            s.ttalt === t || (s.ttalt = t)
+        end
         s.tealt = _epoch_value(s.epoch)
     else
         s.tpalt === _CSE_INVALID || (s.tpalt = _CSE_INVALID)
     end
     return nothing
+end
+
+# Fill the const- and time-cadence levels at value type `T` into the buffer
+# `ue` holds, each tier only when its stamp says `p` (or `(p, t, forcing
+# epoch)`) moved.
+@inline function _obsext_fill_cadence!(
+        ext::_ObsExtVec, const_levels::Tuple, time_levels::Tuple,
+        due, ue, p, t, ::Type{T}
+    ) where {T}
+    if !isempty(const_levels) && _obsext_const_stale(ext, T, p)
+        _fill_obs_levels!(const_levels, due, ue, p, t, T)
+        _obsext_mark_const!(ext, T, p)
+    end
+    if !isempty(time_levels) && _obsext_t_stale(ext, T, p, t)
+        _fill_obs_levels!(time_levels, due, ue, p, t, T)
+        _obsext_mark_t!(ext, T, p, t)
+    end
+    return nothing
+end
+
+# Whether `T` is a ForwardDiff `Dual` over a plain `Float64`. Only
+# EarthSciASTForwardDiffExt answers yes: without ForwardDiff there is no Dual.
+_obs_f64_dual(::Type) = false
+
+# Whether a call at value type `T` takes its const- and time-cadence observeds
+# from the Float64 buffer: `T` is a Dual over `Float64` and neither `p` nor `t`
+# carries one, so every derivative the call carries is with respect to the
+# state, and those observeds, which read no state, have none. Their value is
+# then the Float64 buffer's, as a `T` with zero partials. A call whose `p` or
+# `t` carries a Dual, or at any other `T` (a Float32 or BigFloat state, a
+# nested Dual, whose arithmetic gives other values), fills its own buffer.
+@inline _obsext_cadence_from_f64(ext::_ObsExtVec, ::Type{T}, p, t) where {T} =
+    _obs_f64_dual(T) && _rhs_value_type(ext.nostate, p, t) === Float64
+
+# The const- and time-cadence observeds of a call that takes them from the
+# Float64 buffer (`_obsext_cadence_from_f64`): the Float64 buffer is brought up
+# to `(p, t, forcing epoch)` first, filled in Float64 where a Float64 call has
+# not already, then each tier's slots are copied into the call's buffer `o`
+# when its own stamp is stale. A Jacobian at one `t` copies them once and
+# evaluates none of them in Dual arithmetic.
+function _obsext_cadence_from_f64!(
+        ext::_ObsExtVec, const_levels::Tuple, time_levels::Tuple,
+        const_slots::Vector{UnitRange{Int}}, time_slots::Vector{UnitRange{Int}},
+        o::Vector{T}, p, t, n_states::Int
+    ) where {T}
+    st = ext.nostate
+    length(st) == n_states || (st = ext.nostate = fill(NaN, n_states))
+    v = _ObsSplitVec(st, ext.f64, n_states)
+    _obsext_fill_cadence!(ext, const_levels, time_levels, v, v, p, t, Float64)
+    if !isempty(const_levels) && _obsext_const_stale(ext, T, p)
+        _obsext_copy_slots!(o, ext.f64, const_slots)
+        _obsext_mark_const!(ext, T, p)
+    end
+    if !isempty(time_levels) && _obsext_t_stale(ext, T, p, t)
+        _obsext_copy_slots!(o, ext.f64, time_slots)
+        _obsext_mark_t!(ext, T, p, t)
+    end
+    return nothing
+end
+
+@inline function _obsext_copy_slots!(
+        o::Vector{T}, f64::Vector{Float64},
+        slots::Vector{UnitRange{Int}}
+    ) where {T}
+    @inbounds for r in slots, i in r
+        o[i] = convert(T, f64[i])
+    end
+    return nothing
+end
+
+# The observed-buffer positions (`slot - n_states`) of the materialized
+# observeds `names`, one range per observed's block, in slot order.
+function _obs_buffer_slots(var_map::StateLayout, names, n_states::Int)
+    out = UnitRange{Int}[]
+    for n in names
+        b = _layout_block(var_map, n)
+        b === nothing && continue
+        push!(out, (b.base - n_states):(b.base + b.len - 1 - n_states))
+    end
+    return sort!(out; by = first)
 end
 
 # Synthesize the per-cell fill equation for one materialized array observed:
@@ -3720,27 +3820,35 @@ end
 # `p` moved or the buffer is new. `time_levels` holds the time-cadence ones,
 # which read only const ones and each other; they run next, and only when
 # `(p, t, the build's forcing epoch)` moved — so the columns of a Jacobian, all
-# at one `t`, fill them once.
+# at one `t`, fill them once. A ForwardDiff call that differentiates the state
+# alone takes both tiers from the Float64 buffer instead of evaluating them in
+# Dual arithmetic (`_obsext_cadence_from_f64!`); `const_slots` / `time_slots`
+# are their observed-buffer positions (`_obs_buffer_slots`).
 function _make_rhs_with_obs_buffers(
         f_state!, n_total::Int, n_states::Int,
         levels::Tuple, const_levels::Tuple = (),
         time_levels::Tuple = (),
-        epoch::_ForcingEpoch = _new_forcing_epoch()
+        epoch::_ForcingEpoch = _new_forcing_epoch(),
+        const_slots::Vector{UnitRange{Int}} = UnitRange{Int}[],
+        time_slots::Vector{UnitRange{Int}} = UnitRange{Int}[]
     )
     isempty(levels) && isempty(const_levels) && isempty(time_levels) && return f_state!
     ext = _ObsExtVec(n_total - n_states, epoch)
+    # Without the positions of a tier it has, a call cannot copy that tier.
+    from_f64 = (isempty(const_levels) || !isempty(const_slots)) &&
+        (isempty(time_levels) || !isempty(time_slots))
     function f!(du, u, p, t)
         T = _rhs_value_type(u, p, t)
         o = _obsext_buf(ext, T)
         uv = _ObsSplitVec(_obsext_state(ext, u, T), o, n_states)
         duv = _ObsSplitVec(du, o, n_states)
-        if !isempty(const_levels) && _obsext_const_stale(ext, T, p)
-            _fill_obs_levels!(const_levels, duv, uv, p, t, T)
-            _obsext_mark_const!(ext, T, p)
-        end
-        if !isempty(time_levels) && _obsext_t_stale(ext, T, p, t)
-            _fill_obs_levels!(time_levels, duv, uv, p, t, T)
-            _obsext_mark_t!(ext, T, p, t)
+        if from_f64 && _obsext_cadence_from_f64(ext, T, p, t)
+            _obsext_cadence_from_f64!(
+                ext, const_levels, time_levels, const_slots, time_slots,
+                o, p, t, n_states
+            )
+        else
+            _obsext_fill_cadence!(ext, const_levels, time_levels, duv, uv, p, t, T)
         end
         # Fill the observed buffers level by level: a level's defs read only the
         # state and STRICTLY LOWER levels, both already valid in `uv`.
@@ -4929,7 +5037,9 @@ function _build_compile_evaluator(
                 nst = obs_nst
             ),
             n_total, n_states, Tuple(mat_levels), Tuple(mat_const_levels),
-            Tuple(mat_time_levels), forcing_epoch
+            Tuple(mat_time_levels), forcing_epoch,
+            _obs_buffer_slots(var_map, mat_const, n_states),
+            _obs_buffer_slots(var_map, mat_time, n_states)
         )
         discrete_refill === nothing ? rhs0 : _make_rhs_discrete_refill(rhs0, discrete_refill)
     elseif form === :oop

@@ -219,6 +219,7 @@ include("testutils.jl")  # shared prelude: repo root, AST builders, _normj, _req
     include("grid_invariance_test.jl")               # compiled IR size is O(1) in the grid
     include("fn_content_cse_test.jl")                # fn specs keyed by CONTENT in per-kernel CSE
     include("array_obs_materialize_test.jl")         # factored array observeds ≡ the interpreter's inlining build
+    include("array_obs_dual_cadence_test.jl")        # a state Jacobian takes stateless observeds from the Float64 buffer
     include("cadence_refresh_test.jl")               # every refresh kind reaches the const/time memoized tiers
     include("codegen_kernel_test.jl")                # B1 codegen tier ≡ pre-codegen (differential)
     include("codegen_lanespec_test.jl")              # B1 tier accepts per-lane interp specs (class merge)

@@ -2,8 +2,11 @@
     EarthSciASTForwardDiffExt
 
 The AD-primal seam, loaded automatically when `ForwardDiff` is in the session.
-It supplies the one method the core `EarthSciAST._value` generic is missing:
-unwrap a `ForwardDiff.Dual` to the real number underneath it.
+It supplies the methods two core generics are missing: `EarthSciAST._value`,
+which unwraps a `ForwardDiff.Dual` to the real number underneath it, and
+`EarthSciAST._obs_f64_dual`, which says a Dual over a plain `Float64` is one
+(so a Jacobian takes the observeds that read no state from the Float64 buffer,
+build.jl).
 
 Why an extension rather than a hard dependency: nothing in the numeric core
 needs ForwardDiff, and the core's `_value(x) = x` identity is COMPLETE on its
@@ -22,7 +25,7 @@ carries no derivative and that `Dates.unix2datetime` can only perform on a real
 """
 module EarthSciASTForwardDiffExt
 
-import EarthSciAST: _value
+import EarthSciAST: _value, _obs_f64_dual
 import ForwardDiff
 
 # Recursive, so a nested `Dual` (ForwardDiff-over-ForwardDiff — e.g. a
@@ -30,5 +33,9 @@ import ForwardDiff
 # down to the underlying real primal in a single call rather than yielding an
 # inner `Dual` that `Float64(…)` would still choke on.
 @inline _value(d::ForwardDiff.Dual) = _value(ForwardDiff.value(d))
+
+# NOT recursive: a nested Dual's value is itself a Dual, which a Float64
+# buffer cannot stand in for.
+_obs_f64_dual(::Type{<:ForwardDiff.Dual{<:Any, Float64}}) = true
 
 end

@@ -531,7 +531,7 @@ function _inst_kind(@nospecialize(x), @nospecialize(k), c::_InstCtx)
         y = _ObsExtVec(
             _inst(x.f64, c), nothing, _CSE_INVALID, _CSE_INVALID, _CSE_INVALID,
             NaN, UInt64(0), _CSE_INVALID, _CSE_INVALID, UInt64(0),
-            _inst(x.epoch, c), nothing
+            _inst(x.epoch, c), nothing, Float64[], NaN
         )
         push!(c.caches, y)
         return c.memo[x] = y
