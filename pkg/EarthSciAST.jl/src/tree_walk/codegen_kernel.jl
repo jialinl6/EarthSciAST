@@ -2736,6 +2736,133 @@ function _cg_direct_subcalls!(ctx::_CGCtx, ex, byval::Bool)
     return ex
 end
 
+# PARALLEL COMPILE AT BUILD (ESS_CODEGEN_PARALLEL_COMPILE=1). With the direct
+# call every generated function an RHS reaches is a static call, so the RHS's
+# first call compiles all of them, one after another, before it runs: CONUS's
+# largest section has 52 sub-functions at ~5 s each. Julia compiles a
+# function's static callees together with the function, so by the time any
+# code inside that first call runs they are already compiled; the one place
+# to compile them in parallel is before it. With the switch on, a build ends
+# by reading the generated functions its RHS's Float64 call `f!(du, u0, p, t)`
+# reaches off that call's inferred code, and compiling them on
+# `Threads.nthreads()` tasks — the sections' sub-functions, then the
+# sections' own functions — and then the RHS itself (`_cg_parallel_compile`).
+# Only when compiling happens moves: the code, and so every value, is the one
+# the first call would have compiled. Off by default, read once per build; an
+# error is logged at debug level and leaves the compile to the first call.
+# Another argument type (a ForwardDiff Jacobian's) is not known at build:
+# calling `_cg_parallel_compile` with its types before its first call does
+# the same for it.
+_cg_parallel_compile_enabled() = get(ENV, "ESS_CODEGEN_PARALLEL_COMPILE", "") == "1"
+
+# Whether a value of type `T` holds a generated function anywhere in it,
+# judged from the type alone.
+function _cg_holds_rgf(@nospecialize(T), seen::Base.IdSet{Any} = Base.IdSet{Any}())
+    T isa Union && return _cg_holds_rgf(T.a, seen) || _cg_holds_rgf(T.b, seen)
+    T isa UnionAll && return _cg_holds_rgf(Base.unwrap_unionall(T), seen)
+    T isa DataType || return false
+    T <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction && return true
+    T in seen && return false
+    push!(seen, T)
+    for x in T.parameters
+        _cg_holds_rgf(x, seen) && return true
+    end
+    return false
+end
+
+# The call signature of every method the call `sig` statically invokes, read
+# off its optimized inferred code. Julia 1.12 invokes a CodeInstance, possibly
+# wrapped in an ABIOverride, and earlier versions a MethodInstance.
+function _cg_invoked(@nospecialize(sig))
+    out = Any[]
+    for (ci, _) in Base.code_typed_by_type(sig; optimize = true)
+        ci isa Core.CodeInfo || continue
+        for st in ci.code
+            (st isa Expr && st.head === :invoke) || continue
+            mi = st.args[1]
+            mi isa Core.CodeInstance && (mi = mi.def)
+            isdefined(Core, :ABIOverride) && mi isa Core.ABIOverride && (mi = mi.def)
+            mi isa Core.MethodInstance && mi.specTypes isa DataType && push!(out, mi.specTypes)
+        end
+    end
+    return out
+end
+
+# The generated functions the call `sig` reaches, each once: `roots`, the
+# `generated_callfunc` calls made from ordinary code (each section's own
+# function), and `subs`, the ones those make (a split's sub-functions). The
+# ordinary code followed is what holds a generated function in its arguments,
+# the only code that can call one, so the walk stays on the RHS's own code.
+# A sub-function's own calls are not read: compiling it compiles them, and
+# reading a function's inferred code costs about what compiling it does, on
+# one thread.
+function _cg_compile_sigs(@nospecialize(sig))
+    gcf = typeof(RuntimeGeneratedFunctions.generated_callfunc)
+    roots = Any[]
+    subs = Any[]
+    seen = Set{Any}(Any[sig])
+    todo = Any[sig]
+    while !isempty(todo)
+        tt = pop!(todo)
+        ingen = tt.parameters[1] === gcf
+        for s in _cg_invoked(tt)
+            s in seen && continue
+            if s.parameters[1] === gcf
+                push!(seen, s)
+                push!(ingen ? subs : roots, s)
+                # A generated function's own type is its second parameter: it
+                # calls sub-functions only if they are passed to it.
+                !ingen && any(_cg_holds_rgf, s.parameters[3:end]) && push!(todo, s)
+            elseif !ingen && any(_cg_holds_rgf, s.parameters)
+                push!(seen, s)
+                push!(todo, s)
+            end
+        end
+    end
+    return subs, roots
+end
+
+# Compile every signature of `sigs` on up to `Threads.nthreads()` tasks, each
+# taking the next one off a shared counter.
+function _cg_precompile_parallel(sigs::Vector{Any})
+    n = length(sigs)
+    next = Threads.Atomic{Int}(1)
+    @sync for _ in 1:min(Threads.nthreads(), n)
+        Threads.@spawn while true
+            i = Threads.atomic_add!(next, 1)
+            i > n && break
+            precompile(sigs[i])
+        end
+    end
+    return nothing
+end
+
+# Compile the call `f(args…)` for `argtypes` (a `Tuple` type), with the
+# generated functions it reaches compiled in parallel first: the sections'
+# sub-functions, each with whatever it calls in turn; then the sections' own
+# functions, which find their sub-functions done; then the call itself.
+# Returns whether it compiled anything: not with one thread, nor for a call
+# that reaches no generated function, nor on an error, and the first call
+# then compiles everything as it would have.
+function _cg_parallel_compile(@nospecialize(f), @nospecialize(argtypes))
+    _threads_available() || return false
+    try
+        sig = Tuple{Core.Typeof(f), argtypes.parameters...}
+        subs, roots = _cg_compile_sigs(sig)
+        isempty(roots) && return false
+        _cg_precompile_parallel(subs)
+        _cg_precompile_parallel(roots)
+        precompile(sig)
+        return true
+    catch err
+        @debug(
+            "Parallel compile failed; the first call compiles instead",
+            exception = (err, catch_backtrace())
+        )
+        return false
+    end
+end
+
 # Every Symbol referenced anywhere in `ex` (recursively). Used to compute the
 # exact set of outer-scope locals a chunk function must receive as arguments.
 function _cg_collect_syms!(acc::Set{Symbol}, ex)
