@@ -2667,8 +2667,10 @@ const _CG_FNS = :_cgfns
 #     `RuntimeGeneratedFunction` and handed to the body at run time in a tuple,
 #     appended to the `tabs` argument; a call site is `_cgfns[k](…)` at a
 #     LITERAL `k`, so the callee is a concrete callable the compiler resolves
-#     statically — no closure is constructed. The tuple is threaded into every
-#     sub-function that calls another, so nesting works to any depth.
+#     statically — no closure is constructed — and a finished build calls it
+#     through `generated_callfunc` (`_cg_direct_subcall`). The tuple is
+#     threaded into every sub-function that calls another, so nesting works to
+#     any depth.
 #
 #   INNER DEFINITION (Julia ≥ 1.12, with `ESS_CODEGEN_SPLIT_TRANSPORT=inner`):
 #     the sub-function is an `@noinline function` written inside the generated
@@ -2690,6 +2692,49 @@ const _CG_FNS = :_cgfns
 # testable now that no build takes it by default.
 _cg_split_by_value() =
     !_cg_split_supported() || get(ENV, "ESS_CODEGEN_SPLIT_TRANSPORT", "") != "inner"
+
+# DIRECT SUB-FUNCTION CALLS (by-value transport). A call site `_cgfns[k](…)`
+# goes through the RuntimeGeneratedFunction's functor, which hands its
+# arguments on to `generated_callfunc` by splatting them, and inference does not
+# expand a splat of more than 32 elements. A chunk sub-function takes du/u/p/t
+# plus every outer local its loops read — some 60 arguments on a large section
+# — so its call was a dynamic `Core._apply_iterate`: it allocated on every call,
+# and since its exact signature never appeared in the caller's inferred code,
+# each sub-function compiled on its own first call, one after another. Calling
+# `generated_callfunc(_cgfns[k], …)` is what the functor does, without the
+# splat: a static call, bit-identical. Read once per build;
+# ESS_CODEGEN_DIRECT_SUBCALL=0 keeps the functor form, for an A/B comparison.
+_cg_direct_subcall() = get(ENV, "ESS_CODEGEN_DIRECT_SUBCALL", "") != "0"
+
+# Rewrite, in place, every by-value call `_cgfns[k](args…)` in `ex` into
+# `generated_callfunc(_cgfns[k], args…)`. A rewritten call's callee is the
+# `GlobalRef`, so a subtree reached twice is rewritten once.
+function _cg_rewrite_subcalls!(ex)
+    ex isa Expr || return ex
+    for a in ex.args
+        _cg_rewrite_subcalls!(a)
+    end
+    if ex.head === :call && !isempty(ex.args)
+        f = ex.args[1]
+        if f isa Expr && f.head === :ref && length(f.args) == 2 &&
+                f.args[1] === _CG_FNS && f.args[2] isa Int
+            pushfirst!(ex.args, GlobalRef(RuntimeGeneratedFunctions, :generated_callfunc))
+        end
+    end
+    return ex
+end
+
+# The direct-call rewrite over a finished by-value build: its root expression
+# `ex` and every sub-function in `ctx.helpers`, just before they become
+# generated functions. It runs after the partition, so `_cg_is_spill_call` and
+# the helper dedup (which stores the `_cgfns[k]` callee) only ever see the
+# `_cgfns[k](…)` form. A build that split nothing has no call to rewrite.
+function _cg_direct_subcalls!(ctx::_CGCtx, ex, byval::Bool)
+    (byval && !isempty(ctx.helpers) && _cg_direct_subcall()) || return ex
+    _cg_rewrite_subcalls!(ex)
+    foreach(_cg_rewrite_subcalls!, ctx.helpers)
+    return ex
+end
 
 # Every Symbol referenced anywhere in `ex` (recursively). Used to compute the
 # exact set of outer-scope locals a chunk function must receive as arguments.
@@ -3196,6 +3241,7 @@ function _build_codegen_rhs(
         :(return nothing)
     )
     ex = Expr(:function, Expr(:tuple, :du, :u, :p, :t, :tabs, :_cgci, :_cgnc), body)
+    _cg_direct_subcalls!(ctx, ex, byval)
     f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(
         @__MODULE__, @__MODULE__, ex
     )

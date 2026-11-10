@@ -706,6 +706,7 @@ function _sc_build_gen(
         :function,
         Expr(:tuple, :du, :u, :p, :t, :_cgcache, :tabs, :_cgci, :_cgnc), body
     )
+    _cg_direct_subcalls!(ctx, ex, byval)
     f = RuntimeGeneratedFunctions.RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ex)
     tabpack = ntuple(g -> Vector{ctx.tab_types[g]}(ctx.tab_objs[g]), ngrp)
     if byval && !isempty(ctx.helpers)

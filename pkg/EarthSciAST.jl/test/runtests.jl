@@ -229,6 +229,7 @@ include("testutils.jl")  # shared prelude: repo root, AST builders, _normj, _req
     include("scalar_codegen_test.jl")                # scalar equations + prelude as generated code, emitted by structure (interpreter oracle)
     include("codegen_threaded_test.jl")              # codegen threaded cell axis: chunk instances ≡ serial, disjointness, threaded subprocess
     include("codegen_body_split_test.jl")            # ess-iip-body-split oversized kernel body split across @noinline helpers ≡ un-split (node-cap oracle)
+    include("codegen_direct_subcall_test.jl")        # by-value split sub-functions of >32 arguments called through generated_callfunc ≡ the functor form (allocation-free)
     include("codegen_subcall_fn_test.jl")            # ess-cg-subcall-fn template sub-kernels emitted ONCE as @noinline fns ≡ per-site inline (opt-in tier)
     include("stencil_indexed_contraction_test.jl")   # reduced-rank + contracted makearray region values fire affine ≡ per-cell (interpreter oracle)
     include("lane_table_intern_test.jl")             # content-equal lane tables `===` at build (interpreter oracle)
