@@ -5206,9 +5206,9 @@ function _build_evaluator_impl(
             end
         end
     end
-    # ESS_CODEGEN_PARALLEL_COMPILE=1 (codegen_kernel.jl): compile the RHS for
-    # its Float64 call, with its generated functions in parallel, before
-    # anything calls it.
+    # Unless ESS_CODEGEN_PARALLEL_COMPILE=0 (codegen_kernel.jl): compile the
+    # RHS for its Float64 call, with its generated functions in parallel,
+    # before anything calls it. With one thread this does nothing.
     if _cg_parallel_compile_enabled() && get(kwargs, :form, :inplace) === :inplace
         f!, u0, p = out
         _cg_parallel_compile(f!, Tuple{typeof(u0), typeof(u0), typeof(p), Float64})

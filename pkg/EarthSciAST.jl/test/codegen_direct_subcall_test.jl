@@ -17,13 +17,14 @@
 #     allocates no more than the un-split build does.
 # The direct call makes every generated function an RHS reaches a static call,
 # which Julia compiles together with its caller, one after another, so with
-# ESS_CODEGEN_PARALLEL_COMPILE=1 a build compiles them on several tasks before
-# anything calls the RHS. This pins what that compiles (the section's own
-# function and its sub-functions, read off the RHS's Float64 call), that a
-# build compiles them all before the first call where a build without the
-# switch compiles nothing, and that no value changes: in this process, and in
-# a `julia -t 4` subprocess (the CHILD branch at the end) where the compile is
-# parallel and the section runs chunked.
+# more than one thread a build compiles them on several tasks before anything
+# calls the RHS (unless ESS_CODEGEN_PARALLEL_COMPILE=0). This pins how the
+# switch reads, what the build compiles (the section's own function and its
+# sub-functions, read off the RHS's Float64 call), that the default build
+# compiles them all before the first call where a build with
+# ESS_CODEGEN_PARALLEL_COMPILE=0 compiles nothing, and that no value changes:
+# in this process, and in a `julia -t 4` subprocess (the CHILD branch at the
+# end) where the compile is parallel and the section runs chunked.
 using Test
 using Logging
 using EarthSciAST
@@ -173,19 +174,19 @@ if get(ENV, "ESS_DS_CHILD", "") == "1"
         model, ics = _ds_model(32, 40)
         cap = "ESS_CODEGEN_FN_NODE_CAP" => _DS_CAP
 
-        # Without the switch, a build compiles nothing: nothing has called
-        # the RHS yet.
-        fo, u0, po, _ = _ds_build(model, ics, cap)
+        # With ESS_CODEGEN_PARALLEL_COMPILE=0, a build compiles nothing:
+        # nothing has called the RHS yet.
+        fo, u0, po, _ = _ds_build(model, ics, cap, "ESS_CODEGEN_PARALLEL_COMPILE" => "0")
         subs, roots = ESM._cg_compile_sigs(_ds_rhs_sig(fo, u0, po))
         @test !isempty(roots)
         @test !isempty(subs)
         @test !any(_ds_compiled, roots)
         @test !any(_ds_compiled, subs)
 
-        # With it, the build compiles them before returning. The two builds
+        # By default the build compiles them before returning. The two builds
         # emit the same code, so their generated functions are the same ones.
         fp, vp, pp, tp = _ds_build(
-            model, ics, cap, "ESS_CODEGEN_PARALLEL_COMPILE" => "1"
+            model, ics, cap, "ESS_CODEGEN_PARALLEL_COMPILE" => nothing
         )
         @test get(tp, :codegen_kernel, 0) >= 1
         @test _ds_decl(tp) == 0
@@ -264,13 +265,18 @@ else
     end
 
 
-    # ESS_CODEGEN_PARALLEL_COMPILE=1 in this process: under the default test run
-    # it has one thread, and the build then compiles nothing ahead. The compile
-    # itself runs in the subprocess at the end.
+    # The parallel compile in this process: under the default test run it has
+    # one thread, and the default build then compiles nothing ahead. The
+    # compile itself runs in the subprocess at the end.
     @testset "parallel compile at build" begin
+        # On unless ESS_CODEGEN_PARALLEL_COMPILE=0.
+        for (v, on) in ((nothing, true), ("1", true), ("0", false))
+            @test withenv(ESM._cg_parallel_compile_enabled, "ESS_CODEGEN_PARALLEL_COMPILE" => v) === on
+        end
+
         model, ics = _ds_model(32, 40)
         cap = "ESS_CODEGEN_FN_NODE_CAP" => _DS_CAP
-        fo, u0, po, _ = _ds_build(model, ics, cap)
+        fo, u0, po, _ = _ds_build(model, ics, cap, "ESS_CODEGEN_PARALLEL_COMPILE" => "0")
 
         # What a build compiles ahead, read off the RHS's Float64 call: the
         # section's own function and the sub-functions it calls — the build's
@@ -288,7 +294,7 @@ else
         @test isempty(rsubs)
         @test length(rroots) == 1
 
-        fp, vp, pp, tp = _ds_build(model, ics, cap, "ESS_CODEGEN_PARALLEL_COMPILE" => "1")
+        fp, vp, pp, tp = _ds_build(model, ics, cap, "ESS_CODEGEN_PARALLEL_COMPILE" => nothing)
         @test get(tp, :codegen_kernel, 0) >= 1
         @test _ds_decl(tp) == 0
         @test vp == u0

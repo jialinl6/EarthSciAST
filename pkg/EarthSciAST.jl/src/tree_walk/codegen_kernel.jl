@@ -2736,24 +2736,26 @@ function _cg_direct_subcalls!(ctx::_CGCtx, ex, byval::Bool)
     return ex
 end
 
-# PARALLEL COMPILE AT BUILD (ESS_CODEGEN_PARALLEL_COMPILE=1). With the direct
+# PARALLEL COMPILE AT BUILD (on with more than one thread). With the direct
 # call every generated function an RHS reaches is a static call, so the RHS's
 # first call compiles all of them, one after another, before it runs: CONUS's
 # largest section has 52 sub-functions at ~5 s each. Julia compiles a
 # function's static callees together with the function, so by the time any
 # code inside that first call runs they are already compiled; the one place
-# to compile them in parallel is before it. With the switch on, a build ends
-# by reading the generated functions its RHS's Float64 call `f!(du, u0, p, t)`
-# reaches off that call's inferred code, and compiling them on
-# `Threads.nthreads()` tasks — the sections' sub-functions, then the
-# sections' own functions — and then the RHS itself (`_cg_parallel_compile`).
-# Only when compiling happens moves: the code, and so every value, is the one
-# the first call would have compiled. Off by default, read once per build; an
-# error is logged at debug level and leaves the compile to the first call.
+# to compile them in parallel is before it. So a build ends by reading the
+# generated functions its RHS's Float64 call `f!(du, u0, p, t)` reaches off
+# that call's inferred code, and compiling them on `Threads.nthreads()` tasks
+# — the sections' sub-functions, then the sections' own functions — and then
+# the RHS itself (`_cg_parallel_compile`). Only when compiling happens moves:
+# the code, and so every value, is the one the first call would have
+# compiled. It is on by default (a no-op with one thread) and only for an
+# in-place build (`form = :inplace`). ESS_CODEGEN_PARALLEL_COMPILE=0, read
+# once per build, leaves the compile to the first call, and so does an error,
+# which is logged at debug level.
 # Another argument type (a ForwardDiff Jacobian's) is not known at build:
 # calling `_cg_parallel_compile` with its types before its first call does
 # the same for it.
-_cg_parallel_compile_enabled() = get(ENV, "ESS_CODEGEN_PARALLEL_COMPILE", "") == "1"
+_cg_parallel_compile_enabled() = get(ENV, "ESS_CODEGEN_PARALLEL_COMPILE", "") != "0"
 
 # Whether a value of type `T` holds a generated function anywhere in it,
 # judged from the type alone.
