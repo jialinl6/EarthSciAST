@@ -5596,7 +5596,7 @@ function _build_evaluator_impl(
         insp.observed_build = Ref{Any}(nothing)
         insp.observed_ctx = nothing
     end
-    return _with_compiler_plan(plan) do
+    out = _with_compiler_plan(plan) do
         _with_build_record(record) do
             try
                 return _build_evaluator_impl_pools(model; kwargs...)
@@ -5608,6 +5608,14 @@ function _build_evaluator_impl(
             end
         end
     end
+    # Unless ESS_CODEGEN_PARALLEL_COMPILE=0 (codegen_kernel.jl): compile the
+    # RHS for its Float64 call, with its generated functions in parallel,
+    # before anything calls it. With one thread this does nothing.
+    if _cg_parallel_compile_enabled() && get(kwargs, :form, :inplace) === :inplace
+        f!, u0, p = out
+        _cg_parallel_compile(f!, Tuple{typeof(u0), typeof(u0), typeof(p), Float64})
+    end
+    return out
 end
 
 # The shifted-scatter kernels this build holds out of the class merge
